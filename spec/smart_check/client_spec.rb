@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'stringio'
 
 RSpec.describe SmartCheck::Client do
   let(:url)      { 'https://smart-check-staging.begateway.com' }
@@ -148,6 +149,51 @@ RSpec.describe SmartCheck::Client do
     end
   end
 
+  describe 'logging' do
+    let(:output) { StringIO.new }
+    let(:client) do
+      described_class.new(url: url, user_id: user_id, password: password, logger: Logger.new(output))
+    end
+
+    it 'filters authorization and PAN without changing the authenticated request' do
+      params = { card_pan: '4200000000000000', date_from: '2025-01-01' }
+      stub = stub_request(:post, "#{url}/api/v1/transactions/local")
+        .with(headers: { 'Authorization' => basic_auth_header }, body: params.to_json)
+        .to_return(status: 200, body: { status: 'successful', data: {} }.to_json)
+
+      expect(client.transactions_local(params)).to be_success
+      expect(stub).to have_been_requested.once
+      expect(output.string).to include('Authorization: [FILTERED]', '2025-01-01')
+      expect(output.string).not_to include(basic_auth_header, params[:card_pan])
+    end
+
+    it 'filters the complete registration password, including escaped characters' do
+      params = { username: 'log-filter-test', password: "synthetic-\"quoted\"-\\password!" }
+      stub = stub_request(:post, "#{url}/api/v1/users")
+        .with(body: params.to_json)
+        .with { |request| !request.headers.key?('Authorization') }
+        .to_return(status: 201, body: { status: 'successful' }.to_json)
+
+      expect(client.create_user(params)).to be_success
+      expect(stub).to have_been_requested.once
+      expect(output.string).to include('"password":"[FILTERED]"', params[:username])
+      expect(output.string).not_to include('synthetic-', 'quoted', params[:password].to_json)
+    end
+
+    it 'filters sensitive response fields while preserving the returned response' do
+      body = { status: 'successful', data: { password: 'response-secret', card_pan: '4200000000000000' } }
+      stub_request(:post, "#{url}/api/v1/transactions/global")
+        .to_return(status: 200, body: JSON.pretty_generate(body))
+
+      response = client.transactions_global({})
+
+      expect(response).to be_success
+      expect(response.stats).to eq(body[:data].transform_keys(&:to_s))
+      expect(output.string).to include('"password": "[FILTERED]"', '"card_pan": "[FILTERED]"')
+      expect(output.string).not_to include('response-secret', body[:data][:card_pan])
+    end
+  end
+
   describe 'connection errors' do
     it 'wraps Faraday connection errors into a 500 Response' do
       stub_request(:post, "#{url}/api/v1/transactions/local")
@@ -171,6 +217,61 @@ RSpec.describe SmartCheck::Client do
 
   describe 'proxy' do
     after { described_class.proxy = nil }
+
+    let(:options) { {} }
+    let(:client) { described_class.new(url: url, options: options, logger: Logger.new(StringIO.new)) }
+
+    around do |example|
+      keys = %w[http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY]
+      saved = keys.map { |key| [key, ENV[key]] }.to_h
+      keys.each { |key| ENV.delete(key) }
+      ENV['http_proxy'] = ENV['https_proxy'] = 'http://environment-proxy:3142'
+      example.run
+    ensure
+      saved.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
+    end
+
+    def transport_proxy
+      observed = nil
+      response = double(code: '200', body: '{"status":"successful"}', message: 'OK')
+      allow(response).to receive(:each_header)
+      expect_any_instance_of(Faraday::Adapter::NetHttp).to receive(:perform_request) do |*args|
+        http = args.find { |arg| arg.is_a?(Net::HTTP) }
+        observed = { enabled: http.proxy?, host: http.proxy_address, port: http.proxy_port }
+        response
+      end
+      expect(client.transactions_global({})).to be_success
+      observed
+    end
+
+    it 'uses the environment proxy when no proxy option is supplied' do
+      expect(transport_proxy).to eq(enabled: true, host: 'environment-proxy', port: 3142)
+    end
+
+    it 'uses the global proxy when environment proxy is absent' do
+      ENV.delete('http_proxy')
+      ENV.delete('https_proxy')
+      described_class.proxy = 'http://global-proxy:3128'
+      expect(transport_proxy).to eq(enabled: true, host: 'global-proxy', port: 3128)
+    end
+
+    context 'with an explicit per-client proxy' do
+      let(:options) { { proxy: 'http://dedicated-proxy:3129' } }
+
+      it 'takes precedence over global and environment proxies' do
+        described_class.proxy = 'http://global-proxy:3128'
+        expect(transport_proxy).to eq(enabled: true, host: 'dedicated-proxy', port: 3129)
+      end
+    end
+
+    context 'with an explicit nil proxy' do
+      let(:options) { { proxy: nil } }
+
+      it 'keeps the environment proxy behavior for a nil option' do
+        described_class.proxy = 'http://global-proxy:3128'
+        expect(transport_proxy).to eq(enabled: true, host: 'environment-proxy', port: 3142)
+      end
+    end
 
     it 'is configurable globally' do
       described_class.proxy = 'http://proxy.example.com:3128'

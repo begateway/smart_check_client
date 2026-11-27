@@ -95,7 +95,8 @@ module SmartCheck
         c.request :json
 
         c.response :logger, logger, { headers: true, bodies: true, log_level: :info } do |l|
-          l.filter(/(Authorization:) .+/, '\1 [FILTERED]')
+          l.filter(/(Authorization:)[^\r\n]*/i, '\1 [FILTERED]')
+          l.filter(/("(?:password|card_pan)"\s*:\s*)"(?:\\.|[^"\\])*"/i, '\1"[FILTERED]"')
         end
 
         c.headers = { 'Content-Type' => 'application/json' }.update(headers.to_h)
